@@ -1,0 +1,92 @@
+# agent.py — 多 Agent 协同入口（Supervisor 监督者模式，支持 MCP 外部工具）
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from langchain_openai import ChatOpenAI
+from hybrid_retriever import get_hybrid_retriever
+from tools import create_tools
+from mcp_client import load_all_mcp_tools
+from multi_agent import build_multi_agent
+
+# ========== 初始化模型 ==========
+
+model = ChatOpenAI(
+    model="deepseek-v4-flash",  # DeepSeek V4 Flash 的 API 名称
+    temperature=0,
+    openai_api_key=os.getenv("DEEPSEEK_API_KEY"),
+    openai_api_base="https://api.deepseek.com/v1",
+    # 关闭思考模式：deepseek-v4 默认开启思考，其工具调用轮次的
+    # reasoning_content 必须在后续请求中回传，而 langchain-openai 会丢弃该字段，
+    # 导致多 Agent 交接后（历史含其他 worker 的 tool_call）稳定触发 400。
+    # 关闭后无 reasoning_content，彻底规避该问题。
+    extra_body={"thinking": {"type": "disabled"}},
+)
+
+# ========== 混合检索器配置（供 _get_retriever 复用） ==========
+
+RETRIEVER_OPTS = {
+    "vectorK": 10,
+    "bm25K": 10,
+    "finalK": 3,
+    "vectorWeight": 0.5,
+    "bm25Weight": 0.5,
+    "rerankCandidates": 10,
+}
+
+
+async def _get_retriever():
+    """返回混合检索器实例。
+
+    命中全局缓存；文档入库后调用 refresh_retriever() 置空缓存，
+    下次调用会自动重建（含最新数据的 BM25 索引），无需重启服务。
+    """
+    return await get_hybrid_retriever(RETRIEVER_OPTS)
+
+
+async def init_agent():
+    """异步初始化多 Agent 系统（包含 await 操作）"""
+    # ========== 预热混合检索器（尽早暴露配置错误） ==========
+    await _get_retriever()
+
+    # ========== 创建工具（本地 + MCP） ==========
+    # 1. 加载本地工具（传入 getter，调用时实时解析，数据更新后无需重启）
+    local_tools = create_tools(_get_retriever)
+
+    # 2. 加载 MCP 外部工具
+    mcp_tools = await load_all_mcp_tools("config/mcp-servers.config.json")
+
+    # 3. 合并（用于调试输出）
+    all_tools = list(local_tools) + list(mcp_tools)
+
+    # ========== 按工具域分组（喂给对应 worker） ==========
+    # 注意：tools.py 中 search 工具的注册名是 "search_kb"（非 "search_knowledge_base"），
+    # 这里同时匹配两个名称以兼容。
+    knowledge_tools = [
+        t for t in local_tools
+        if t.name in {"get_deepseek_info", "search_kb", "search_knowledge_base"}
+    ]
+    general_tools = [t for t in local_tools if t.name == "get_weather"]
+    devops_tools = [t for t in mcp_tools if t.name.startswith("gitee_")]
+
+    # ========== 调试输出 ==========
+    print(f"\n[Agent] 共 {len(all_tools)} 个工具可用（按域分组）:")
+    for group, tools in [
+        ("knowledge(知识/检索)", knowledge_tools),
+        ("devops(Gitee/MCP)", devops_tools),
+        ("general(天气/日常)", general_tools),
+    ]:
+        for t in tools:
+            print(f"  [{group}] {t.name}")
+
+    # ========== 构建多 Agent 图（Supervisor 模式） ==========
+    agent = await build_multi_agent(model, {
+        "knowledge": knowledge_tools,
+        "devops": devops_tools,
+        "general": general_tools,
+    })
+
+    print("[Agent] 多 Agent 系统就绪: supervisor + 3 个专业 worker")
+    return agent, all_tools

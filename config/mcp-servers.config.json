@@ -1,0 +1,11 @@
+[
+  {
+    "name": "gitee",
+    "command": "npx",
+    "args": ["-y", "@gitee/mcp-gitee@latest"],
+    "env": {
+      "GITEE_API_BASE": "https://gitee.com/api/v5",
+      "GITEE_ACCESS_TOKEN": "af49623854e859b39493ff029383603f"
+    }
+  }
+]
