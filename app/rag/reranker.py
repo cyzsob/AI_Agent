@@ -4,6 +4,9 @@ import asyncio
 from typing import Optional
 
 from langchain_core.documents import Document
+from app.core.logging import get_logger
+
+logger = get_logger()
 
 
 class CrossEncoderReranker:
@@ -65,7 +68,7 @@ class CrossEncoderReranker:
         try:
             scores = await asyncio.to_thread(self._predict, query, docs)
         except Exception as err:
-            print(f"[Reranker] 重排失败，按原顺序返回候选: {err}")
+            logger.warning(f"重排失败，按原顺序返回候选: {err}")
             return docs
 
         ranked = sorted(zip(scores, docs), key=lambda pair: pair[0], reverse=True)

@@ -19,7 +19,10 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_postgres import PGVector
-from parse_pdf import parse_pdf
+from app.ingestion.pdf_parser import parse_pdf
+from app.core.logging import get_logger
+
+logger = get_logger()
 
 DOCS_DIR = Path("data/documents")
 SUPPORTED_EXTS = {".txt", ".pdf", ".docx"}
@@ -178,8 +181,8 @@ def sync_documents(*, prune: bool = False, rebuild: bool = False) -> dict:
     target_files = sorted(f for f in files if f.suffix.lower() in SUPPORTED_EXTS)
 
     if not target_files:
-        print(f"未在 {DOCS_DIR}/ 目录下找到支持的文档文件。")
-        print(f"支持的文件格式: {', '.join(sorted(SUPPORTED_EXTS))}")
+        logger.warning(f"未在 {DOCS_DIR}/ 目录下找到支持的文档文件。")
+        logger.info(f"支持的文件格式: {', '.join(sorted(SUPPORTED_EXTS))}")
 
     # ---------- 3. 计算指纹，与注册表对比，确定待处理文件 ----------
     conn = _open_conn()
@@ -190,7 +193,7 @@ def sync_documents(*, prune: bool = False, rebuild: bool = False) -> dict:
             delete_all_chunks(conn)
             delete_registry_all(conn)
             conn.commit()
-            print("已清空向量库与注册表，执行全量重建...")
+            logger.info("已清空向量库与注册表，执行全量重建...")
 
         registry = load_registry(conn)
 
@@ -204,11 +207,11 @@ def sync_documents(*, prune: bool = False, rebuild: bool = False) -> dict:
             reg = registry.get(rel)
             if reg and reg["hash"] == sha:
                 result["skipped"] += 1
-                print(f"  - 跳过(未变化): {rel}")
+                logger.info(f"跳过(未变化): {rel}")
             else:
                 is_new = reg is None
                 files_to_index.append((rel, f, sha, is_new))
-                print(f"  - {'新增' if is_new else '更新'}: {rel}")
+                logger.info(f"{'新增' if is_new else '更新'}: {rel}")
 
         # 3.2 注册表 → 磁盘对比（仅 --prune 时清理已删除文档）
         if prune:
@@ -217,13 +220,13 @@ def sync_documents(*, prune: bool = False, rebuild: bool = False) -> dict:
                     delete_chunks_by_source(conn, rel)
                     delete_registry_row(conn, rel)
                     result["removed"] += 1
-                    print(f"  - 移除(磁盘已删除): {rel}")
+                    logger.info(f"移除(磁盘已删除): {rel}")
             if result["removed"]:
                 conn.commit()
 
         # ---------- 4. 无变更时直接返回（避免无谓初始化嵌入模型/向量库） ----------
         if not files_to_index:
-            print("所有文档均已是最新，无需处理。")
+            logger.info("所有文档均已是最新，无需处理。")
             return result
 
         # ---------- 5. 初始化嵌入模型 / 向量库 / 分块器 ----------
@@ -253,17 +256,17 @@ def sync_documents(*, prune: bool = False, rebuild: bool = False) -> dict:
         # ---------- 6. 逐个文件处理：解析 → 分块 → 删旧 → 嵌入入库 → 更新注册表 ----------
         for rel, file_path, sha, is_new in files_to_index:
             try:
-                print(f"正在解析: {rel}")
+                logger.info(f"正在解析: {rel}")
                 content = parse_file(file_path)
                 if not content or not content.strip():
-                    print(f"  ⚠ 文件 {rel} 解析结果为空，跳过")
+                    logger.warning(f"文件 {rel} 解析结果为空，跳过")
                     result["errors"].append(f"{rel}: 解析结果为空")
                     continue
 
                 raw_doc = Document(page_content=content, metadata={"source": rel})
                 chunks = splitter.split_documents([raw_doc])
                 if not chunks:
-                    print(f"  ⚠ 文件 {rel} 分块结果为空，跳过")
+                    logger.warning(f"文件 {rel} 分块结果为空，跳过")
                     result["errors"].append(f"{rel}: 分块结果为空")
                     continue
 
@@ -287,11 +290,11 @@ def sync_documents(*, prune: bool = False, rebuild: bool = False) -> dict:
                 conn.commit()
 
                 result["added" if is_new else "updated"] += 1
-                print(f"  ✓ {rel}: {total} 个文档块已{'新增' if is_new else '更新'} ({len(content)} 字符)")
+                logger.info(f"{rel}: {total} 个文档块已{'新增' if is_new else '更新'} ({len(content)} 字符)")
             except Exception as err:
                 # 处理失败保留旧数据与注册表不动
                 result["errors"].append(f"{rel}: {err}")
-                print(f"  ✗ 处理失败: {rel} - {err}")
+                logger.error(f"处理失败: {rel} - {err}")
     finally:
         conn.close()
 
@@ -320,19 +323,19 @@ def main():
     try:
         result = sync_documents(prune=args.prune, rebuild=args.rebuild)
     except Exception as err:
-        print(f"❌ 同步失败: {err}")
+        logger.error(f"同步失败: {err}")
         sys.exit(1)
 
-    print("\n========== 同步完成 ==========")
-    print(
+    logger.info("同步完成")
+    logger.info(
         f"新增: {result['added']} | 更新: {result['updated']} | "
         f"跳过: {result['skipped']} | 移除: {result['removed']}"
     )
     if result["errors"]:
-        print(f"错误 ({len(result['errors'])}):")
+        logger.error(f"错误 ({len(result['errors'])}):")
         for err in result["errors"]:
-            print(f"  - {err}")
-    print("提示：检索服务运行时可通过 POST /api/admin/sync 触发同步，无需重启。")
+            logger.error(f"  - {err}")
+    logger.info("提示：检索服务运行时可通过 POST /api/admin/sync 触发同步，无需重启。")
 
 
 if __name__ == "__main__":

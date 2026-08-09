@@ -19,6 +19,9 @@ from langgraph.graph.message import RemoveMessage, add_messages
 from langgraph.prebuilt import create_react_agent
 from langgraph.types import Command
 
+from app.core.logging import get_logger
+logger = get_logger()
+
 # ========== 状态定义 ==========
 
 
@@ -323,17 +326,17 @@ def _make_supervisor_node(model, members: dict[str, str], tool_to_node: dict[str
 
         if handoff_target:
             if handoff_target not in tool_to_node.values():
-                print(f"[Supervisor] 未知转交目标: {handoff_target}，忽略")
+                logger.warning(f"未知转交目标: {handoff_target}，忽略")
             elif handoff_target in handled:
                 # 目标成员已处理过（其输出已在对话中）→ 再转交只会 ping-pong，
                 # 确定性结束本轮
-                print(f"[Supervisor] 跨域交接目标 {handoff_target} 已处理过，结束")
+                logger.info(f"跨域交接目标 {handoff_target} 已处理过，结束")
                 return Command(
                     goto=END,
                     update={"handoff_checked_upto": len(msgs)},
                 )
             else:
-                print(f"[Supervisor] 检测到跨域交接请求 -> {handoff_target}")
+                logger.info(f"检测到跨域交接请求 -> {handoff_target}")
                 # 路由前清理本轮历史：删除源 worker 本轮产生的全部消息
                 # （工具执行、工具调用与最终汇总），只保留用户请求与之前的对话，
                 # 避免被转交方读到标记/叙述/已输出内容后误判任务已完成、
@@ -392,7 +395,7 @@ def _make_supervisor_node(model, members: dict[str, str], tool_to_node: dict[str
                 and "general" in tool_to_node.values()
                 and "general" not in handled
             ):
-                print("[Supervisor] LLM 未输出有效路由，兜底转交 general")
+                logger.warning("LLM 未输出有效路由，兜底转交 general")
                 goto = "general"
             else:
                 goto = END

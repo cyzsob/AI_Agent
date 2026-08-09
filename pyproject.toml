@@ -26,8 +26,17 @@ dependencies = [
     "pymupdf>=1.24",
     "rapidocr>=2.0",
     "python-docx>=1.1",
+    "loguru>=0.7",
+    "tiktoken>=0.7",
 ]
 
+[project.scripts]
+# 服务启动入口
+rag-server = "app.main:create_app"
+# CLI 工具
+rag-ingest = "app.scripts.ingest:main"   # TODO: need wrapper
+rag-diagnose = "app.scripts.diagnose:main"  # TODO: need wrapper
+
 [tool.setuptools]
-# 源码位于 app/ 目录，直接以脚本方式运行（python app/server_agui.py），不安装为包
-packages = []
+# 包结构
+packages = ["app"]

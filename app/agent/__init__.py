@@ -1,15 +1,33 @@
-# agent.py — 多 Agent 协同入口（Supervisor 监督者模式，支持 MCP 外部工具）
+# agent/__init__.py — 多 Agent 协同入口
 
 import os
+import sys
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# ========== 环境变量校验 ==========
+_required_env = {
+    "DEEPSEEK_API_KEY": "DeepSeek API 密钥，用于调用 LLM 模型",
+    "DB_HOST": "PostgreSQL 数据库主机地址",
+    "DB_NAME": "PostgreSQL 数据库名称",
+}
+_missing = []
+for _key, _desc in _required_env.items():
+    if not os.getenv(_key):
+        _missing.append(f"  {_key}: {_desc}")
+if _missing:
+    print(f"[Agent] 缺少必要的环境变量，请检查 .env 文件:\n" + "\n".join(_missing))
+    sys.exit(1)
+
+from app.core.logging import get_logger; logger = get_logger()
+
 from langchain_openai import ChatOpenAI
-from hybrid_retriever import get_hybrid_retriever
-from tools import create_tools
-from mcp_client import load_all_mcp_tools
-from multi_agent import build_multi_agent
+from app.rag.retriever import get_hybrid_retriever
+from app.agent.tools import create_tools
+from app.mcp.client import load_all_mcp_tools
+from app.agent.supervisor import build_multi_agent
 
 # ========== 初始化模型 ==========
 
@@ -52,11 +70,16 @@ async def _get_retriever():
     命中全局缓存；文档入库后调用 refresh_retriever() 置空缓存，
     下次调用会自动重建（含最新数据的 BM25 索引），无需重启服务。
     """
-    return await get_hybrid_retriever(RETRIEVER_OPTS)
+    start = time.perf_counter()
+    retriever = await get_hybrid_retriever(RETRIEVER_OPTS)
+    elapsed = (time.perf_counter() - start) * 1000
+    logger.debug(f"检索器初始化耗时: {elapsed:.1f}ms")
+    return retriever
 
 
 async def init_agent():
     """异步初始化多 Agent 系统（包含 await 操作）"""
+    start = time.perf_counter()
     # ========== 预热混合检索器（尽早暴露配置错误） ==========
     await _get_retriever()
 
@@ -81,14 +104,14 @@ async def init_agent():
     devops_tools = [t for t in mcp_tools if t.name.startswith("gitee_")]
 
     # ========== 调试输出 ==========
-    print(f"\n[Agent] 共 {len(all_tools)} 个工具可用（按域分组）:")
+    logger.info(f"共 {len(all_tools)} 个工具可用（按域分组）:")
     for group, tools in [
         ("knowledge(知识/检索)", knowledge_tools),
         ("devops(Gitee/MCP)", devops_tools),
         ("general(天气/日常)", general_tools),
     ]:
         for t in tools:
-            print(f"  [{group}] {t.name}")
+            logger.info(f"  [{group}] {t.name}")
 
     # ========== 构建多 Agent 图（Supervisor 模式） ==========
     agent = await build_multi_agent(model, {
@@ -97,5 +120,5 @@ async def init_agent():
         "general": general_tools,
     })
 
-    print("[Agent] 多 Agent 系统就绪: supervisor + 3 个专业 worker")
+    logger.info(f"多 Agent 系统就绪: supervisor + 3 个专业 worker (初始化耗时: {(time.perf_counter() - start) * 1000:.0f}ms)")
     return agent, all_tools

@@ -3,6 +3,7 @@
 import os
 import re
 import hashlib
+import time
 from typing import Optional
 
 import asyncio
@@ -13,7 +14,8 @@ from langchain_core.retrievers import BaseRetriever
 from langchain_core.documents import Document
 from langchain_postgres import PGVector
 from langchain_ollama import OllamaEmbeddings
-from reranker import CrossEncoderReranker
+from app.rag.reranker import CrossEncoderReranker
+from app.core.logging import get_logger; logger = get_logger()
 
 # ========== 中文分词辅助 ==========
 
@@ -166,13 +168,17 @@ class HybridRetriever(BaseRetriever):
         cached = _QUERY_EMBEDDING_CACHE.get(cache_key)
         if cached is not None:
             return cached
+        _embed_start = time.perf_counter()
         vector = self._vector_store.embeddings.embed_query(query)
+        _embed_elapsed = (time.perf_counter() - _embed_start) * 1000
+        logger.debug(f"查询向量化耗时: {_embed_elapsed:.1f}ms")
         if len(_QUERY_EMBEDDING_CACHE) >= _QUERY_EMBEDDING_CACHE_SIZE:
             _QUERY_EMBEDDING_CACHE.clear()
         _QUERY_EMBEDDING_CACHE[cache_key] = vector
         return vector
 
     async def _get_relevant_documents(self, query: str, **kwargs) -> list[Document]:
+        _retr_start = time.perf_counter()
         # 并行执行向量检索（sync→线程池，含查询向量缓存）和 BM25 检索（async）
         def _vector_search():
             embedding = self._embed_query_cached(query)
@@ -197,9 +203,15 @@ class HybridRetriever(BaseRetriever):
 
         # Cross-Encoder 重排（可选）→ 最终 Top-K
         if self._enable_rerank and self._reranker is not None and candidates:
-            return await self._reranker.rerank(query, candidates, top_k=self._final_k)
+            result = await self._reranker.rerank(query, candidates, top_k=self._final_k)
+            _retr_elapsed = (time.perf_counter() - _retr_start) * 1000
+            logger.debug(f"混合检索总耗时: {_retr_elapsed:.1f}ms (向量+BM25+RRF+重排)")
+            return result
 
-        return candidates[: self._final_k]
+        result = candidates[: self._final_k]
+        _retr_elapsed = (time.perf_counter() - _retr_start) * 1000
+        logger.debug(f"混合检索总耗时: {_retr_elapsed:.1f}ms (向量+BM25+RRF)")
+        return result
 
 
 # ========== 工厂函数 ==========
@@ -244,6 +256,8 @@ async def get_hybrid_retriever(options: Optional[dict] = None) -> HybridRetrieve
     rerank_candidates = opts.get("rerankCandidates", 5)
     enable_rerank = opts.get("enableRerank", True)
     force_rebuild = opts.get("forceRebuild", False)
+
+    _start = time.perf_counter()
 
     if _cached_hybrid_retriever is not None and not force_rebuild:
         return _cached_hybrid_retriever
@@ -337,5 +351,8 @@ async def get_hybrid_retriever(options: Optional[dict] = None) -> HybridRetrieve
         rerank_candidates=rerank_candidates,
         enable_rerank=enable_rerank,
     )
+
+    _elapsed = (time.perf_counter() - _start) * 1000
+    logger.info(f"混合检索器构建完成 (向量库 + BM25 索引 + 重排器): {_elapsed:.0f}ms")
 
     return _cached_hybrid_retriever

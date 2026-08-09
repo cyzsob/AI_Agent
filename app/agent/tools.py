@@ -8,6 +8,9 @@ from pathlib import Path
 import httpx
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
+from app.core.logging import get_logger
+
+logger = get_logger()
 
 # ========== 中文城市名 → 英文映射 ==========
 
@@ -74,13 +77,13 @@ async def fetch_weather(city: str) -> str:
 @tool
 async def get_deepseek_info() -> str:
     """获取 DeepSeek 公司的详细介绍信息，包括公司背景、技术突破（V3/V4 系列）、架构创新（MoE、混合注意力）、开源战略（MIT 协议）、商业模式（API 定价）、融资发展等完整公司介绍。当用户询问关于 DeepSeek 公司整体情况时使用此工具。"""
-    print("[Tool] get_deepseek_info 被调用")
+    logger.info("get_deepseek_info 被调用")
     try:
         content = Path("data/documents/deepseek介绍手册.txt").read_text(encoding="utf-8")
-        print(f"[Tool] get_deepseek_info 返回 {len(content)} 字符")
+        logger.info(f"get_deepseek_info 返回 {len(content)} 字符")
         return content
     except Exception as err:
-        print(f"[Tool] get_deepseek_info 读取失败: {err}")
+        logger.error(f"get_deepseek_info 读取失败: {err}")
         return "无法获取 DeepSeek 公司介绍信息，请稍后重试。"
 
 
@@ -91,7 +94,7 @@ class SearchKnowledgeBaseInput(BaseModel):
 @tool(args_schema=SearchKnowledgeBaseInput)
 async def search_knowledge_base(query: str) -> str:
     """在知识库中搜索与用户问题相关的文档内容。当用户询问关于 DeepSeek 技术的具体细节（如模型参数、版本特性、性能指标、架构细节、技术参数等）时，调用此工具获取相关信息。输入应为简洁的关键词或问题。"""
-    print(f'[Tool] search_knowledge_base 被调用, query: "{query}"')
+    logger.info(f'search_knowledge_base 被调用, query: "{query}"')
     # 此函数需要 retriever 注入，实际调用时由 agent.py 传入闭包
     # 这里抛出提示，实际使用时会被 agent.py 中的工厂函数替换
     return "知识库检索功能未初始化，请通过 create_tools() 工厂函数创建工具。"
@@ -104,7 +107,7 @@ class GetWeatherInput(BaseModel):
 @tool(args_schema=GetWeatherInput)
 async def get_weather(city: str) -> str:
     """查询指定城市的实时天气信息，包括温度、天气状况、湿度、风速等。当用户询问天气、温度、气候等实时信息时使用此工具。输入应为城市名称，如"北京"、"上海"、"Tokyo"等。"""
-    print(f'[Tool] get_weather 被调用, city: "{city}"')
+    logger.info(f'get_weather 被调用, city: "{city}"')
     return await fetch_weather(city)
 
 
@@ -129,17 +132,17 @@ def create_tools(retriever_getter):
     @tool(args_schema=SearchKBInput)
     async def search_kb(query: str) -> str:
         """在知识库中搜索与用户问题相关的文档内容。当用户询问关于 DeepSeek 技术的具体细节（如模型参数、版本特性、性能指标、架构细节、技术参数等）时，调用此工具获取相关信息。输入应为简洁的关键词或问题。"""
-        print(f'[Tool] search_knowledge_base 被调用, query: "{query}"')
+        logger.info(f'search_knowledge_base (injected) 被调用, query: "{query}"')
         try:
             retriever = await retriever_getter()
             docs = await retriever._get_relevant_documents(query)
             result = "\n\n---\n\n".join(doc.page_content for doc in docs)
-            print(f"[Tool] search_knowledge_base 返回 {len(docs)} 个文档片段")
+            logger.info(f"search_knowledge_base 返回 {len(docs)} 个文档片段")
             if not result.strip():
                 return "知识库中没有找到相关信息。"
             return result
         except Exception as err:
-            print(f"[Tool] search_knowledge_base 检索失败: {err}")
+            logger.error(f"search_knowledge_base 检索失败: {err}")
             return "知识库检索出错，请稍后重试。"
 
     # Tool 3: get_weather — 直接返回

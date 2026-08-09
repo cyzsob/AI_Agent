@@ -10,7 +10,10 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda
-from hybrid_retriever import get_hybrid_retriever
+from app.rag.retriever import get_hybrid_retriever
+from app.core.logging import get_logger
+
+logger = get_logger()
 
 
 async def main():
@@ -70,8 +73,8 @@ async def main():
 
     async def rewrite_step(user_input: str):
         rewritten = await rewrite_chain.ainvoke({"input": user_input})
-        print(f'[Query Rewrite] 原始: "{user_input}"')
-        print(f'[Query Rewrite] 改写: "{rewritten}"')
+        logger.info(f'[Query Rewrite] 原始: "{user_input}"')
+        logger.info(f'[Query Rewrite] 改写: "{rewritten}"')
         return {"original": user_input, "rewritten": rewritten}
 
     async def retrieve_step(data: dict):
@@ -86,13 +89,13 @@ async def main():
 
     # ---------- 6. 执行查询 ----------
     user_question = "deepseek的开源战略是什么"
-    print(f"问题: {user_question}")
+    logger.info(f"问题: {user_question}")
 
     try:
         answer = await chain.ainvoke(user_question)
-        print(f"回答: {answer}")
+        logger.info(f"回答: {answer}")
     except Exception as err:
-        print(f"❌ 查询失败: {err}")
+        logger.error(f"❌ 查询失败: {err}")
 
 
 if __name__ == "__main__":

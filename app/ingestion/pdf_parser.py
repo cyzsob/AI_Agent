@@ -3,6 +3,10 @@
 import numpy as np
 import fitz  # PyMuPDF
 
+from app.core.logging import get_logger
+
+logger = get_logger()
+
 # 文本提取的最小字符数 —— 低于此值认为 PDF 以图片为主，优先使用 OCR 结果
 MIN_TEXT_LENGTH = 80
 
@@ -56,13 +60,13 @@ def parse_pdf(file_path: str) -> str:
     """
     doc = fitz.open(file_path)
     num_pages = len(doc)
-    print(f"  [PDF] 共 {num_pages} 页")
+    logger.info(f"  [PDF] 共 {num_pages} 页")
 
     text_parts = []
     ocr_parts = []
 
     for i in range(num_pages):
-        print(f"  [PDF] 处理第 {i + 1}/{num_pages} 页...")
+        logger.info(f"  [PDF] 处理第 {i + 1}/{num_pages} 页...")
         page = doc[i]
 
         # ---- 提取可选择文本 ----
@@ -70,24 +74,24 @@ def parse_pdf(file_path: str) -> str:
             page_text = page.get_text().strip()
             if page_text:
                 text_parts.append(page_text)
-                print(f"   文本: {len(page_text)} 字符")
+                logger.info(f"   文本: {len(page_text)} 字符")
         except Exception as text_err:
-            print(f"   文本提取失败: {text_err}")
+            logger.warning(f"   文本提取失败: {text_err}")
 
         # ---- 渲染为图片 + OCR ----
         try:
             img = _page_to_image(page, scale=2.0)  # 2x 提升 OCR 精度
             height, width = img.shape[:2]
             if width < 10 or height < 10:
-                print(f"   页面尺寸过小 ({width}x{height})，跳过 OCR")
+                logger.warning(f"   页面尺寸过小 ({width}x{height})，跳过 OCR")
                 continue
 
             ocr_page_text = _ocr_page(img)
             if ocr_page_text:
                 ocr_parts.append(ocr_page_text)
-                print(f"   OCR: {len(ocr_page_text)} 字符")
+                logger.info(f"   OCR: {len(ocr_page_text)} 字符")
         except Exception as ocr_err:
-            print(f"   OCR 失败: {ocr_err}")
+            logger.warning(f"   OCR 失败: {ocr_err}")
 
     doc.close()
 
@@ -95,7 +99,7 @@ def parse_pdf(file_path: str) -> str:
     text_content = "\n".join(text_parts)
     ocr_text = "\n\n".join(ocr_parts)
     merged = merge_text(text_content, ocr_text)
-    print(f"  [PDF] 合并后共 {len(merged)} 字符")
+    logger.info(f"  [PDF] 合并后共 {len(merged)} 字符")
     return merged
 
 

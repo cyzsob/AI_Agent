@@ -3,6 +3,8 @@
 
 import os
 import json
+import time
+import asyncio
 from contextlib import AsyncExitStack
 from typing import Any, Optional
 
@@ -10,6 +12,9 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, create_model, Field
+
+from app.core.logging import get_logger
+logger = get_logger()
 
 # 所有活跃的 MCP 连接（用于清理）
 # 每个连接包含: exit_stack, session, name
@@ -75,8 +80,8 @@ async def create_tools_from_mcp_server(
     args = server_config.get("args", [])
     env = server_config.get("env", {})
 
-    print(f"[MCP] 连接服务器: {name}")
-    print(f"[MCP]   命令: {command} {' '.join(args)}")
+    logger.info(f"连接服务器: {name}")
+    logger.debug(f"命令: {command} {' '.join(args)}")
 
     merged_env = {**os.environ, **env}
 
@@ -86,17 +91,31 @@ async def create_tools_from_mcp_server(
         env=merged_env,
     )
 
-    # 使用 exit_stack 管理 stdio_client 和 ClientSession 的生命周期
-    read, write = await exit_stack.enter_async_context(stdio_client(server_params))
-    session = await exit_stack.enter_async_context(ClientSession(read, write))
-
-    await session.initialize()
-    print(f"[MCP] {name}: 连接成功")
+    # 使用 exit_stack 管理 stdio_client 和 ClientSession 的生命周期（含重试）
+    max_retries = 3
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            start = time.perf_counter()
+            read, write = await exit_stack.enter_async_context(stdio_client(server_params))
+            session = await exit_stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+            elapsed = (time.perf_counter() - start) * 1000
+            logger.info(f"{name}: 连接成功 ({elapsed:.0f}ms)")
+            break
+        except Exception as err:
+            last_error = err
+            if attempt < max_retries - 1:
+                backoff = 2 ** attempt
+                logger.warning(f"{name}: 连接失败 (第{attempt + 1}次), {backoff}s 后重试: {err}")
+                await asyncio.sleep(backoff)
+            else:
+                raise RuntimeError(f"{name}: 连接失败（已重试 {max_retries} 次）: {last_error}") from last_error
 
     # 发现该 Server 暴露的所有工具
     tools_result = await session.list_tools()
     tools = tools_result.tools
-    print(f"[MCP] {name}: 发现 {len(tools)} 个工具")
+    logger.info(f"{name}: 发现 {len(tools)} 个工具")
 
     # 将每个 MCP Tool 包装为 LangChain StructuredTool
     langchain_tools = []
@@ -128,7 +147,7 @@ async def create_tools_from_mcp_server(
                             parts.append(str(c))
                     return "\n".join(parts)
                 except Exception as err:
-                    print(f"[MCP] {srv_name}.{tool_name} 调用失败: {err}")
+                    logger.error(f"{srv_name}.{tool_name} 调用失败: {err}")
                     return f"工具调用失败: {err}"
             return call_tool
 
@@ -155,9 +174,9 @@ async def disconnect_all_mcp_servers() -> None:
     for conn in reversed(_active_connections):
         try:
             await conn["exit_stack"].aclose()
-            print(f"[MCP] 断开连接: {conn['name']}")
+            logger.info(f"断开连接: {conn['name']}")
         except Exception as err:
-            print(f"[MCP] 断开失败: {conn['name']} {err}")
+            logger.error(f"断开失败: {conn['name']} {err}")
     _active_connections.clear()
 
 
@@ -171,14 +190,14 @@ async def load_all_mcp_tools(config_path: str) -> list:
         list[StructuredTool]
     """
     if not os.path.exists(config_path):
-        print(f"[MCP] 配置文件不存在: {config_path}，跳过 MCP 工具加载")
+        logger.warning(f"配置文件不存在: {config_path}，跳过 MCP 工具加载")
         return []
 
     with open(config_path, "r", encoding="utf-8") as f:
         server_configs = json.load(f)
 
     if not isinstance(server_configs, list) or len(server_configs) == 0:
-        print("[MCP] 配置文件为空，跳过")
+        logger.warning("配置文件为空，跳过")
         return []
 
     # 为所有 MCP 连接创建一个共享的 AsyncExitStack
@@ -191,7 +210,7 @@ async def load_all_mcp_tools(config_path: str) -> list:
             tools = await create_tools_from_mcp_server(config, exit_stack)
             all_tools.extend(tools)
         except Exception as err:
-            print(f'[MCP] 加载服务器 "{config["name"]}" 失败: {err}')
+            logger.error(f'加载服务器 "{config["name"]}" 失败: {err}')
 
     _active_connections.clear()
     _active_connections.append({
