@@ -12,7 +12,7 @@
 
 from typing import Annotated, TypedDict
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import RemoveMessage, add_messages
@@ -128,7 +128,9 @@ def _worker_prompt(node: str) -> str:
         "等表述，只表示任务被转交到协调员，**绝不代表任务已完成**\n"
         "2. 如果历史中还没有该领域的工具结果，属于你领域范围的任务**必须由你实际调用工具完成**，"
         "绝对不要再次转交（否则会造成死循环）\n"
-        "3. 只有确实不属于任何已有 Agent 领域、且历史中也没有结果的新任务，才允许调用 handoff_to_xxx 转交"
+        "3. 只有确实不属于任何已有 Agent 领域、且历史中也没有结果的新任务，才允许调用 handoff_to_xxx 转交\n"
+        "4. 你的最终回答**只包含你自己领域的内容**；其他 Agent 已经回答并展示给用户的部分"
+        "（如已输出的天气结果），**绝对不要在你的回答中重复**"
     )
     prompts = {
         "knowledge": (
@@ -139,7 +141,9 @@ def _worker_prompt(node: str) -> str:
             "2. 用户询问具体技术细节（模型参数、版本特性、性能指标、架构细节等）时，"
             "**必须**调用 search_knowledge_base 工具检索知识库\n"
             "3. 基于工具返回的内容回答，禁止凭空编造；工具无结果时如实告知用户\n"
-            "4. 只使用分配给你的工具；如果用户请求中还有属于其他专业领域（如实时天气、Gitee 操作）"
+            "4. **回答必须结构清晰、避免冗余**：每个要点只写一次，不要在同一个回答中"
+            "重复已经说过的段落或句子。如果发现自己在重复已输出的内容，立即停止\n"
+            "5. 只使用分配给你的工具；如果用户请求中还有属于其他专业领域（如实时天气、Gitee 操作）"
             "的部分，先检查对话历史：若该部分**已有回答结果**则视为已完成、不要转交；"
             "若尚未完成，完成自己的部分后**必须调用对应的 handoff_to_xxx 工具**转交剩余部分，"
             "然后再简短告知用户已转交；禁止只用文字说\u201c交回协调员\u201d却不调用转交工具"
@@ -207,14 +211,21 @@ def _clean_history_for_handoff(msgs: list, start: int) -> tuple[list, int]:
     若不清除，被转交方（下一个 worker）会读到这些消息，可能产生两种误判：
       1. 读到 HANDOFF_REQUEST 标记 / "已转交协调员" 的叙述，误以为任务已处理完，
          只输出汇总而不调用自己的领域工具；
-      2. 读到其他 worker 的工具调用记录，干扰其对"任务属于谁"的判断（再次转交，
-         造成 ping-pong 死循环）。
+      2. 读到其他 worker 的工具调用记录或最终汇总，干扰其对"任务属于谁"的判断
+         ——既可能再次转交（ping-pong 死循环），也可能把其他 worker 已回答过的
+         内容（如天气结果）原样抄进自己的最终回答（重复回答）。
 
     本函数在 supervisor 检测到标记、准备路由到目标 worker 之前被调用：
-      - 删除 msgs[start:] 范围内（即上一轮新增）的**所有 ToolMessage**
-      - 删除其中**所有携带 tool_calls 的 assistant 消息**
-      - 保留纯文本 assistant 消息（各 worker 的最终汇总，供被转交方了解已完成部分）
-    这样被转交方只能看到"用户请求 + 其他 worker 的结论"，看不到中间工具执行细节。
+      删除 msgs[start:] 范围内（即上一轮新增）的**所有消息**：
+        - 所有 ToolMessage
+        - 所有携带 tool_calls 的 assistant 消息
+        - 纯文本 assistant 消息（源 worker 的最终汇总也一并删除）
+    这样被转交方只能看到"用户请求 + 之前的对话"，看不到源 worker 的工具执行
+    细节与已输出过的答案，只能回答自己领域内、历史中还没有结果的部分。
+
+    防死循环不依赖这些残留消息，而是由 supervisor 的确定性机制保证：
+      - handled_members：已处理过的成员不会被再次路由
+      - handoff_checked_upto 游标：转交标记只会被消费一次
 
     Returns:
         (updates, remaining_count)
@@ -224,16 +235,58 @@ def _clean_history_for_handoff(msgs: list, start: int) -> tuple[list, int]:
     """
     remove_ids: set[str] = set()
     for msg in msgs[start:]:
-        msg_type = getattr(msg, "type", None)
-        if msg_type == "tool":
-            remove_ids.add(msg.id)
-        elif msg_type == "ai" and (
-            getattr(msg, "tool_calls", None) or getattr(msg, "invalid_tool_calls", None)
-        ):
-            remove_ids.add(msg.id)
+        remove_ids.add(msg.id)
 
     updates = [RemoveMessage(id=mid) for mid in remove_ids]
     return updates, len(msgs) - len(remove_ids)
+
+
+# ========== Supervisor 输入裁剪 ==========
+#
+# 背景：supervisor 每轮路由都携带全量会话历史（含 worker 的检索结果，可能数千
+# token），而一轮问答中 supervisor 会被调用多次（初始路由 + worker 返回后判断
+# 收尾），导致每次 LLM 调用的 TTFT 与成本都随历史膨胀。路由决策真正依赖的只是
+# "最新用户请求 + 各 worker 已输出的结论"，因此这里构造精简输入喂给 LLM。
+#
+# 注意：跨域交接检测基于 handoff_checked_upto 游标在完整 msgs 上确定性扫描
+# （见 _detect_handoff），不依赖此处输入；裁剪只影响 LLM 路由的上下文，不改变
+# 交接/收尾的确定性机制。
+
+
+def _build_supervisor_input(msgs: list) -> list:
+    """构造 supervisor 的 LLM 输入：最新一条 user 消息 + 最近若干条 worker 文本结论（截断）。
+
+    相比直接传入全量 msgs，能显著减少每次路由调用的 input token，降低 TTFT 与成本。
+    """
+    inputs = []
+
+    # 1) 最新一条用户请求（路由决策的主体）
+    human_msgs = [
+        m for m in msgs if getattr(m, "type", None) == "human"
+    ]
+    if human_msgs:
+        last = human_msgs[-1]
+        content = getattr(last, "content", None)
+        if isinstance(content, str):
+            inputs.append(HumanMessage(content=content))
+        else:
+            inputs.append(last)
+
+    # 2) 最近若干条 worker 文本结论（供 supervisor 判断"所有部分是否已完成"），
+    #    每条截断到固定长度，避免大段回答拖慢路由调用
+    ai_texts = [
+        m for m in msgs
+        if getattr(m, "type", None) == "ai"
+        and isinstance(getattr(m, "content", None), str)
+        and getattr(m, "content", "").strip()
+    ]
+    for m in ai_texts[-3:]:
+        content = m.content.strip()
+        if len(content) > 300:
+            content = content[:300] + "…"
+        inputs.append(AIMessage(content=content))
+
+    return inputs
 
 
 def _make_supervisor_node(model, members: dict[str, str], tool_to_node: dict[str, str]):
@@ -281,9 +334,10 @@ def _make_supervisor_node(model, members: dict[str, str], tool_to_node: dict[str
                 )
             else:
                 print(f"[Supervisor] 检测到跨域交接请求 -> {handoff_target}")
-                # 路由前清理本轮历史：删除源 worker 的工具执行消息（ToolMessage 与
-                # 携带 tool_calls 的 assistant 消息），只保留用户请求与纯文本汇总，
-                # 避免被转交方读到标记/叙述后误判任务已完成或再次转交
+                # 路由前清理本轮历史：删除源 worker 本轮产生的全部消息
+                # （工具执行、工具调用与最终汇总），只保留用户请求与之前的对话，
+                # 避免被转交方读到标记/叙述/已输出内容后误判任务已完成、
+                # 再次转交或重复回答其他 worker 已答过的部分
                 msg_updates, remaining = _clean_history_for_handoff(msgs, start)
                 return Command(
                     goto=handoff_target,
@@ -310,16 +364,38 @@ def _make_supervisor_node(model, members: dict[str, str], tool_to_node: dict[str
             )
         )
         response = await model.bind_tools(transfer_tools).ainvoke(
-            [sys_msg, *msgs]
+            # 只喂精简输入（最新用户请求 + worker 结论），避免每次路由都携带
+            # 全量历史（含大段检索结果）导致 TTFT 与成本膨胀
+            [sys_msg, *_build_supervisor_input(msgs)]
         )
 
         # 只根据第一个工具调用计算目标节点；不再把 supervisor 的 AIMessage 和
         # 合成的 ToolMessage 写入共享 messages（详见函数 docstring）。
         tool_calls = getattr(response, "tool_calls", None) or []
-        if not tool_calls or tool_calls[0]["name"] == "finish_workflow":
-            goto = END
+        if tool_calls and tool_calls[0]["name"] != "finish_workflow":
+            goto = tool_to_node.get(tool_calls[0]["name"], "general")
         else:
-            goto = tool_to_node.get(tool_calls[0]["name"], END)
+            # 兜底：LLM 未给出有效路由（空响应或直接调用 finish_workflow）。
+            # 典型场景：历史中已出现过"你好→问候"的完整问答，用户再次说"你好"时，
+            # supervisor 误判"请求已处理"而直接结束，导致整个 run 零输出
+            # （客户端只会收到服务端兜底文本"请求处理完成"）。
+            # 修复：只要最新一条是尚未被任何成员处理过的 human 消息，就强制交给
+            # general（通用助手）回答——它能直接应付问候/闲聊，也能通过
+            # handoff_to_xxx 把真正的专业任务确定性转交给对应 worker。
+            last_msg = msgs[-1] if msgs else None
+            is_fresh_human = (
+                last_msg is not None
+                and getattr(last_msg, "type", None) == "human"
+            )
+            if (
+                is_fresh_human
+                and "general" in tool_to_node.values()
+                and "general" not in handled
+            ):
+                print("[Supervisor] LLM 未输出有效路由，兜底转交 general")
+                goto = "general"
+            else:
+                goto = END
 
         update = {"handoff_checked_upto": len(msgs)}
         if goto != END and goto not in handled:

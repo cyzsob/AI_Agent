@@ -31,6 +31,7 @@
 │   ├── query.py                # 命令行 RAG 查询脚本（改写 -> 检索 -> 生成）
 │   ├── ingest.py               # 数据入库脚本（扫描目录 + 解析 TXT/PDF/DOCX + 分块 + 向量化 + 写入 PG）
 │   ├── parse_pdf.py            # PDF 混合解析（PyMuPDF 文本提取 + 页面渲染 + RapidOCR 识别）
+│   ├── multimodal.py           # 多模态图片理解（本地 Ollama 视觉模型 → 图片文字描述）
 │   └── diagnose.py             # 诊断脚本（对比三种检索方式效果）
 ├── config/
 │   └── mcp-servers.config.json # MCP 服务器配置文件
@@ -504,6 +505,7 @@ pip install -e .
 
 # 3. 确保 Ollama 服务运行并加载 bge-m3 模型
 #    ollama pull bge-m3
+#    ollama pull qwen2.5vl:7b   # 多模态图片理解（用户上传图片查询）
 #    ollama serve
 
 # 4. 注入知识库数据（幂等增量同步，自动解析 data/documents/ 下的 TXT/PDF/DOCX）
@@ -543,6 +545,22 @@ curl -X POST http://localhost:3001/api/chat \
 curl -X POST http://localhost:3001/api/chat/clear \
   -H "Content-Type: application/json" \
   -d '{"threadId":"multi-test"}'
+
+# 10. 多模态测试（用户上传图片查询，需已安装 qwen2.5vl:7b）
+#     服务端用本地视觉模型理解图片，生成文字描述后进入 RAG 流程
+#     （PowerShell 示例：将本地图片转为 base64 后发送 AG-UI 多模态消息）
+$img = [Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\path\to\chart.png"))
+$body = @{
+  threadId = "mm-test"; runId = "1";
+  messages = @(@{
+    role = "user";
+    content = @(
+      @{ type = "text"; text = "这张图表说明了什么趋势？" },
+      @{ type = "image"; source = @{ type = "data"; value = $img; mimeType = "image/png" } }
+    )
+  })
+} | ConvertTo-Json -Depth 10
+Invoke-RestMethod -Uri http://localhost:3001/api/chat -Method Post -ContentType "application/json" -Body $body
 ```
 
 ### 验证 MCP 是否接入成功

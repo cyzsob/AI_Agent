@@ -21,7 +21,7 @@ async def main():
         "finalK": 3,
         "vectorWeight": 0.5,
         "bm25Weight": 0.5,
-        "rerankCandidates": 10,
+        "rerankCandidates": 5,
     })
 
     # ---------- 2. 初始化 DeepSeek 模型 ----------
@@ -30,6 +30,9 @@ async def main():
         temperature=0,
         openai_api_key=os.getenv("DEEPSEEK_API_KEY"),
         openai_api_base="https://api.deepseek.com/v1",
+        presence_penalty=0.4,
+        frequency_penalty=0.4,
+        max_tokens=4096,
     )
 
     # ---------- 3. Query Rewrite 链 ----------

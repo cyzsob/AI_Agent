@@ -18,6 +18,13 @@ model = ChatOpenAI(
     temperature=0,
     openai_api_key=os.getenv("DEEPSEEK_API_KEY"),
     openai_api_base="https://api.deepseek.com/v1",
+    # 防止 LLM 在长回答中重复输出相同内容：
+    #   - presence_penalty: 惩罚已出现过的 token，降低段落级重复概率
+    #   - frequency_penalty: 按出现频次惩罚高频 token，抑制短语/句子重复
+    #   - max_tokens: 输出硬上限，防止重复时无限消耗 token
+    presence_penalty=0.4,
+    frequency_penalty=0.4,
+    max_tokens=4096,
     # 关闭思考模式：deepseek-v4 默认开启思考，其工具调用轮次的
     # reasoning_content 必须在后续请求中回传，而 langchain-openai 会丢弃该字段，
     # 导致多 Agent 交接后（历史含其他 worker 的 tool_call）稳定触发 400。
@@ -33,7 +40,9 @@ RETRIEVER_OPTS = {
     "finalK": 3,
     "vectorWeight": 0.5,
     "bm25Weight": 0.5,
-    "rerankCandidates": 10,
+    # 重排候选从 10 降到 5：CPU 上 CrossEncoder 逐对推理耗时随候选数线性增长，
+    # 候选减半可显著缩短检索阶段延迟，RAG 质量损失极小
+    "rerankCandidates": 5,
 }
 
 

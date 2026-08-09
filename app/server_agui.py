@@ -4,6 +4,7 @@ import asyncio
 import os
 import json
 import uuid
+import base64
 import traceback
 from enum import StrEnum
 from contextlib import asynccontextmanager
@@ -15,7 +16,7 @@ load_dotenv()
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
 from agent import init_agent
@@ -26,6 +27,7 @@ from conversation_history import (
     append_messages,
     clear_history,
 )
+from multimodal import describe_image, download_image
 
 
 # ========== AG-UI EventType 枚举（本地定义，无 Python 等价包） ==========
@@ -66,6 +68,12 @@ def _is_internal_tool(name: str) -> bool:
     """判断工具名是否为内部编排工具（supervisor 路由 / worker 跨域交接），
     是则不在 SSE 流中透出、不保存到历史。"""
     return name in TRANSFER_TOOL_NAMES or name.startswith(HANDOFF_TOOL_PREFIX)
+
+
+# ========== 流式调试开关 ==========
+# 逐 token 打印到控制台是阻塞式 I/O，会拖慢事件循环与 SSE 发送（Windows 终端
+# 尤为明显）。生产环境默认关闭，仅在 STREAM_DEBUG=1 时打印逐 chunk 调试日志。
+STREAM_DEBUG = os.getenv("STREAM_DEBUG") == "1"
 
 
 # ========== Lifespan（管理全局初始化和清理） ==========
@@ -132,6 +140,90 @@ def iter_tool_call_pieces(chunk):
                 )
 
 
+# ========== 多模态消息解析与图片理解（用户上传图片查询） ==========
+
+
+def _strip_data_uri(value: str) -> str:
+    """去除 data URI 前缀（如 data:image/png;base64,xxx → xxx），普通 base64 原样返回"""
+    if isinstance(value, str) and value.startswith("data:") and "," in value:
+        return value.split(",", 1)[1]
+    return value
+
+
+def _extract_text_and_images(content) -> tuple[str, list[dict]]:
+    """AG-UI 用户消息 content（str 或 content part 数组）→ (文本, 图片列表)。
+
+    图片列表元素：
+      - {"bytes": bytes}  内联 base64 图片
+      - {"url": str}      http(s) URL 图片
+
+    兼容两种消息格式：
+      - 新版（2025-10 生效）：{type:"image", source:{type:"data"|"url", value, mimeType?}}
+      - 旧版（BinaryInputContent 兼容）：{type:"image", data:<base64>, mimeType, url?}
+    """
+    if isinstance(content, str):
+        return content, []
+
+    text_parts = []
+    image_parts = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            text_parts.append(str(part.get("text", "")))
+        elif ptype == "image":
+            src = part.get("source") or {}
+            stype = src.get("type")
+            # 新版：source.data（内联 base64）/ source.url（http(s) URL）
+            if stype == "data":
+                raw = src.get("value")
+                if raw:
+                    image_parts.append({"bytes": base64.b64decode(_strip_data_uri(raw))})
+            elif stype == "url":
+                url = src.get("value")
+                if url:
+                    image_parts.append({"url": url})
+            # 旧版兼容：data / url 字段（无 source 包装）
+            elif part.get("data"):
+                image_parts.append({"bytes": base64.b64decode(_strip_data_uri(part["data"]))})
+            elif part.get("url"):
+                image_parts.append({"url": part["url"]})
+    return "\n".join(text_parts).strip(), image_parts
+
+
+async def _describe_images(image_parts: list[dict], user_text: str) -> list[str]:
+    """并发调用本地视觉模型描述多张图片。
+
+    单张图片失败返回错误提示文本（不中断整体请求），保证文本部分照常回答。
+    """
+    async def _describe_one(idx: int, part: dict) -> str:
+        try:
+            if "bytes" in part:
+                description = await describe_image(part["bytes"], user_text)
+            else:
+                image_bytes = await download_image(part["url"])
+                description = await describe_image(image_bytes, user_text)
+            if description:
+                return description
+            return f"（图片{idx + 1} 未能生成描述）"
+        except Exception as err:
+            print(f"[Multimodal] 图片{idx + 1} 理解失败: {err}")
+            return f"（图片{idx + 1} 理解失败：{err}）"
+
+    return await asyncio.gather(*[_describe_one(i, p) for i, p in enumerate(image_parts)])
+
+
+def _compose_multimodal_message(text: str, descriptions: list[str]) -> str:
+    """组装最终纯文本 user 消息：用户文字 + 各图片描述（图片→文字化）"""
+    parts = []
+    if text and text.strip():
+        parts.append(text.strip())
+    for i, desc in enumerate(descriptions):
+        parts.append(f"[图片{i + 1}]: {desc}")
+    return "\n\n".join(parts)
+
+
 # ========== AG-UI 协议端点 ==========
 
 
@@ -156,7 +248,22 @@ async def capabilities():
         "output": {"structuredOutput": False},
         "state": {"persistentState": True},
         "reasoning": {"supported": False},
-        "multimodal": {"input": {}, "output": {}},
+        "multimodal": {
+            "input": {
+                "text": True,
+                "image": True,
+                "audio": False,
+                "video": False,
+                "file": False,
+            },
+            "output": {
+                "text": True,
+                "image": False,
+                "audio": False,
+                "video": False,
+                "file": False,
+            },
+        },
     }
 
 
@@ -164,7 +271,21 @@ async def capabilities():
 async def chat(request: Request):
     """AG-UI 聊天端点（SSE 事件流）"""
 
-    body = await request.json()
+    # 解析失败必须"正常返回"（而非抛异常）：未处理异常由 Starlette 最外层的
+    # ServerErrorMiddleware 直接返回 500，该响应不再经过 CORSMiddleware，导致
+    # 浏览器收不到 Access-Control-Allow-Origin，把真实错误误报成"跨域请求失败"。
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError) as err:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "请求体不是合法 JSON",
+                "hint": "请使用 Content-Type: application/json，且键名必须用双引号",
+                "detail": str(err),
+            },
+        )
+
     thread_id = body.get("threadId")
     run_id = body.get("runId")
     messages = body.get("messages", [])
@@ -188,13 +309,24 @@ async def chat(request: Request):
         })
 
         try:
-            # 从 messages 中提取最后一条 user 消息
-            user_message = ""
+            # 从 messages 中提取最后一条 user 消息（支持字符串或多模态 content 数组）
+            user_text = ""
+            image_parts = []
             for msg in reversed(messages):
                 if msg.get("role") == "user":
-                    content = msg.get("content", "")
-                    user_message = content if isinstance(content, str) else ""
+                    user_text, image_parts = _extract_text_and_images(msg.get("content", ""))
                     break
+
+            # 多模态：并发调用本地视觉模型把图片转成文字描述，再与文本合并
+            if image_parts:
+                descriptions = await _describe_images(image_parts, user_text)
+                user_message = _compose_multimodal_message(user_text, descriptions)
+                print(
+                    f"[Multimodal] 收到 {len(image_parts)} 张图片，"
+                    f"已生成描述: {len(user_message)} 字符"
+                )
+            else:
+                user_message = user_text
 
             if not user_message.strip():
                 raise ValueError("未找到用户消息或消息为空")
@@ -238,16 +370,20 @@ async def chat(request: Request):
                     ns, chunk, metadata = (), *event
                 node_name = metadata.get("langgraph_node") if metadata else None
                 chunk_type = type(chunk).__name__ if chunk else None
-                print(
-                    f"[Stream] ns={ns}, node={node_name}, type={chunk_type}, "
-                    f"has_tool_call_id={getattr(chunk, 'tool_call_id', None) is not None}"
-                )
+                if STREAM_DEBUG:
+                    print(
+                        f"[Stream] ns={ns}, node={node_name}, type={chunk_type}, "
+                        f"has_tool_call_id={getattr(chunk, 'tool_call_id', None) is not None}"
+                    )
 
                 # ---- Supervisor 节点：仅内部路由，不透出事件、不进入历史 ----
                 # supervisor 事件 ns 为空且 node 名为 supervisor；其合成的路由
                 # ToolMessage 同样带 supervisor 节点名，一并在此过滤。
                 if node_name == SUPERVISOR_NODE:
-                    print(f"[Supervisor] 内部路由消息，跳过: {chunk_type}")
+                    # supervisor 输出是流式逐 token 的 AIMessageChunk，每个 token
+                    # 都会进此分支，默认不打印（终端 I/O 阻塞事件循环），调试时开
+                    if STREAM_DEBUG:
+                        print(f"[Supervisor] 内部路由消息，跳过: {chunk_type}")
                     continue
 
                 # ---- 工具执行结果（ToolMessage）：不依赖节点名 ----
@@ -319,10 +455,11 @@ async def chat(request: Request):
                                 print(f"[Stream] 跳过内部编排工具事件: {tc_name}")
                                 continue
 
-                            print(
-                                f"[ToolChunk] id={tc_id}, "
-                                f"args={str(tc_args)[:50] if tc_args else None}"
-                            )
+                            if STREAM_DEBUG:
+                                print(
+                                    f"[ToolChunk] id={tc_id}, "
+                                    f"args={str(tc_args)[:50] if tc_args else None}"
+                                )
 
                             # TOOL_CALL_START — 只在首次出现时发送
                             if tc_id and tc_id not in tool_call_ids:
@@ -392,10 +529,11 @@ async def chat(request: Request):
                             })
                             text_message_started = True
 
-                        print(
-                            f"[Event] >>> TEXT_MESSAGE_CONTENT, "
-                            f"messageId={message_id}, delta={chunk_content[:50]}"
-                        )
+                        if STREAM_DEBUG:
+                            print(
+                                f"[Event] >>> TEXT_MESSAGE_CONTENT, "
+                                f"messageId={message_id}, delta={chunk_content[:50]}"
+                            )
                         yield sse_event({
                             "type": AgUiEventType.TEXT_MESSAGE_CONTENT,
                             "messageId": message_id,
@@ -475,7 +613,9 @@ async def chat(request: Request):
                 yield sse_event({
                     "type": AgUiEventType.TEXT_MESSAGE_CONTENT,
                     "messageId": message_id,
-                    "delta": "请求处理完成。",
+                    # 兜底文本（正常路径下 supervisor 已兜底路由，几乎不会触发）：
+                    # 明确告知"未生成有效回复"，避免误导性的"请求处理完成"
+                    "delta": "抱歉，我暂时没有生成有效的回复，请换个说法再试一次。",
                 })
 
             # TEXT_MESSAGE_END

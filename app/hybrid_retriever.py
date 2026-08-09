@@ -114,6 +114,17 @@ def rrf_merge(
     return [item["doc"] for item in merged[:final_k]]
 
 
+# ========== 查询向量缓存 ==========
+#
+# 每次检索都要对查询调用本地 Ollama 嵌入模型（bge-m3，CPU 上单次数百 ms），
+# 相同/相似的查询（如多轮追问、多个用户问同一问题）会反复触发该调用。
+# 这里对"规范化后的查询文本 → 向量"做进程内缓存：命中时跳过嵌入调用，
+# 直接用缓存向量做 PG 相似度检索，大幅缩短检索阶段延迟。
+
+_QUERY_EMBEDDING_CACHE: dict[str, list[float]] = {}
+_QUERY_EMBEDDING_CACHE_SIZE = 512
+
+
 # ========== 混合检索器 ==========
 
 
@@ -145,10 +156,32 @@ class HybridRetriever(BaseRetriever):
         self._rerank_candidates = rerank_candidates
         self._enable_rerank = enable_rerank
 
+    def _embed_query_cached(self, query: str) -> list[float]:
+        """查询向量化（带进程内缓存，命中时省去 Ollama 嵌入调用）。
+
+        缓存键为规范化后的查询文本；容量超限时整体清空（简单淘汰，
+        避免缓存无限膨胀，且向量维度远大于键长，内存可控）。
+        """
+        cache_key = query.strip().lower()
+        cached = _QUERY_EMBEDDING_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        vector = self._vector_store.embeddings.embed_query(query)
+        if len(_QUERY_EMBEDDING_CACHE) >= _QUERY_EMBEDDING_CACHE_SIZE:
+            _QUERY_EMBEDDING_CACHE.clear()
+        _QUERY_EMBEDDING_CACHE[cache_key] = vector
+        return vector
+
     async def _get_relevant_documents(self, query: str, **kwargs) -> list[Document]:
-        # 并行执行向量检索（sync→线程池）和 BM25 检索（async）
+        # 并行执行向量检索（sync→线程池，含查询向量缓存）和 BM25 检索（async）
+        def _vector_search():
+            embedding = self._embed_query_cached(query)
+            return self._vector_store.similarity_search_by_vector(
+                embedding, k=self._vector_k
+            )
+
         vector_docs, bm25_docs = await asyncio.gather(
-            asyncio.to_thread(self._vector_store.similarity_search, query, k=self._vector_k),
+            asyncio.to_thread(_vector_search),
             self._bm25_retriever._get_relevant_documents(query),
         )
 
@@ -195,7 +228,7 @@ async def get_hybrid_retriever(options: Optional[dict] = None) -> HybridRetrieve
             vectorWeight (float): 向量检索权重，默认 0.5
             bm25Weight (float): BM25 检索权重，默认 0.5
             rerankModel (str): sentence-transformers 重排模型名，默认 "BAAI/bge-reranker-base"
-            rerankCandidates (int): RRF 融合后交给重排器的候选池大小，默认 10
+            rerankCandidates (int): RRF 融合后交给重排器的候选池大小，默认 5
             enableRerank (bool): 是否启用重排，默认 True
             forceRebuild (bool): 强制重建缓存，默认 False
     """
@@ -208,7 +241,7 @@ async def get_hybrid_retriever(options: Optional[dict] = None) -> HybridRetrieve
     vector_weight = opts.get("vectorWeight", 0.5)
     bm25_weight = opts.get("bm25Weight", 0.5)
     rerank_model = opts.get("rerankModel", "BAAI/bge-reranker-base")
-    rerank_candidates = opts.get("rerankCandidates", 10)
+    rerank_candidates = opts.get("rerankCandidates", 5)
     enable_rerank = opts.get("enableRerank", True)
     force_rebuild = opts.get("forceRebuild", False)
 
