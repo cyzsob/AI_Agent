@@ -13,16 +13,18 @@
 8. 记忆存储、压缩与过期技术：采用分层记忆存储机制，结合上下文压缩算法减少 Token 占用，并通过 TTL（Time-To-Live）过期策略自动清理历史记忆，平衡对话质量与存储成本。
 
 项目：RAG智能知识库问答系统    AI应用开发工程师    时间：2026年4月-7月
-项目描述：基于DeepSeek大语言模型和LangGraph Agent框架开发的RAG知识库问答系统
-技术栈：Python 3、LangChain、LangGraph、DeepSeek V4 Flash API、Ollama（bge-m3嵌入模型）、PGVector（余弦相似度）、rank_bm25（BM25关键词检索）、RRF融合、Cross-Encoder重排、FastAPI、AG-UI协议、MCP协议、Vue 3、TypeScript、A2UI协议
-负责模块：后端Agent服务，混合检索模块，知识库数据管道，MCP客户端集成，前端对话界面，A2UI富内容渲染
+项目描述：基于DeepSeek大语言模型和LangGraph多Agent框架开发的RAG知识库问答系统
+技术栈：Python 3、LangChain、LangGraph（Supervisor多Agent）、DeepSeek V4 Flash API、Ollama（bge-m3嵌入模型）、PGVector（余弦相似度）、rank_bm25（BM25关键词检索）、RRF融合、Cross-Encoder重排、FastAPI、AG-UI协议、MCP协议、PyMuPDF + RapidOCR、智谱GLM-4V多模态、Vue 3、TypeScript、A2UI协议
+负责模块：后端Agent服务，混合检索模块，知识库数据管道，MCP客户端集成，多模态图片理解，前端对话界面，A2UI富内容渲染
 技术描述：
-1. Agent 服务基于 LangGraph create_react_agent 构建 ReAct Agent，集成 DeepSeek V4 Flash，自主决策检索策略，支持多轮对话。
-2. 混合检索模块采用 PGVector 向量数据库（余弦相似度）与 BM25 关键词检索双路并行方案，经 RRF算法融合排序后，再二次重排，综合召回多路结果中相关性最高的文档片段。
-3. 聊天模块集成 AG-UI 协议，基于 FastAPI + SSE 实现流式对话，逐 token 实时展示打字机效果，解决流式内容覆盖或丢失问题。
-4. 知识库数据管道支持 TXT/PDF/DOCX 多格式解析，经递归分块与 bge-m3 嵌入模型生成 1024 维向量，写入 PGVector 向量库，支持增量更新。
-5. 集成 MCP 协议，通过 Python mcp SDK 将外部工具包装为 LangChain 工具注入 Agent，修改配置即可扩展，已接入 Gitee。
-6. 前端基于 Vue 3 + TypeScript + Vite，采用 A2uiSurface 渲染 AI 返回的结构化 JSON UI（卡片、列表等），支持亮/暗色主题。
+1. 基于 LangGraph 构建 Supervisor 多 Agent 架构，协调 Agent 路由分发至专业 Worker，支持多轮对话。
+2. 混合检索采用 PGVector 向量与 BM25 双路并行，RRF 融合后经 Cross-Encoder 二次重排。
+3. 基于 FastAPI + SSE 集成 AG-UI 协议，逐 token 流式对话，透传工具调用与完成事件。
+4. 知识库管道支持 TXT/PDF/DOCX 解析，PyMuPDF + RapidOCR 混合解析，sha256 指纹增量入库。
+5. 通过 MCP 协议自动发现外部工具，包装为 LangChain 工具注入 Agent，配置驱动扩展，已接入 Gitee。
+6. 基于 threadId 多轮会话管理，tiktoken 精确计数滑动裁剪，集成查询改写提升检索准确率。
+7. 用户上传图片经智谱 GLM-4V 视觉模型生成文字描述，合并进入 RAG 链路，实现多模态图片问答。
+8. 前端基于 Vue 3 + TypeScript + Vite，渲染 AI 返回的结构化 JSON UI，支持亮/暗色主题。
 
 工作经历
 艾普阳（深圳）科技有限公司     鸿蒙开发 | AI应用开发          2022.06-2025.01

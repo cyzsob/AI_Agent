@@ -1,8 +1,11 @@
 # stream_handler.py — 流式输出工具调用处理（缓冲、追踪、JSON 完整性检测）
 
 import json
+import re
 import uuid
 from typing import Any
+
+from json_repair import repair_json
 
 
 def iter_tool_call_pieces(chunk):
@@ -33,6 +36,52 @@ def iter_tool_call_pieces(chunk):
                     getattr(tc, "name", None),
                     getattr(tc, "args", None),
                 )
+
+
+def robust_parse_tool_args(raw: str) -> dict:
+    """容错解析模型输出的工具调用参数 JSON。
+
+    处理流程（按顺序）：
+      1. 去除 markdown 代码块标记（```json ... ```）
+      2. 定位第一个 { 或 [，去除之前的冗余话语
+      3. 用 json_repair 修复尾部逗号、单引号、中文标点等语法错误
+      4. 用 json.loads 兜底解析
+
+    Args:
+        raw: 模型原始输出的参数字符串
+
+    Returns:
+        解析后的 dict
+
+    Raises:
+        ValueError: 所有解析手段均失败
+    """
+    if not raw or not raw.strip():
+        raise ValueError("输入为空")
+
+    text = raw.strip()
+
+    # 1. 去除 markdown 代码块标记
+    text = re.sub(r"```(?:json)?\s*|\s*```", "", text)
+
+    # 2. 定位第一个 { 或 [，去除之前的冗余话语（如 "好的，结果如下：" 等）
+    m = re.search(r"[\{\[].*[\}\]]", text, re.DOTALL)
+    if m:
+        text = m.group(0)
+
+    # 3. 用 json_repair 修复尾部逗号、单引号、中文标点等语法错误
+    try:
+        repaired = repair_json(text)
+    except Exception:
+        raise ValueError(f"json_repair 修复失败: {raw[:200]}")
+
+    # 4. 用 json.loads 兜底解析
+    try:
+        result = json.loads(repaired)
+    except (json.JSONDecodeError, ValueError):
+        raise ValueError(f"修复后仍无法解析: {repaired[:200]}")
+
+    return result
 
 
 class ToolCallTracker:
@@ -109,8 +158,8 @@ class ToolCallTracker:
             raw_args = self._full_args.get(tc_id)
             if isinstance(raw_args, str):
                 try:
-                    parsed_args = json.loads(raw_args)
-                except (json.JSONDecodeError, ValueError):
+                    parsed_args = robust_parse_tool_args(raw_args)
+                except ValueError:
                     parsed_args = {}
             else:
                 parsed_args = raw_args or {}
@@ -136,7 +185,18 @@ class ToolCallTracker:
                     }))
                     to_delete.append(tc_id)
             except (json.JSONDecodeError, ValueError):
-                pass
+                # 尚未完整，用容错解析再试一次
+                try:
+                    robust_parse_tool_args(accumulated)
+                    if tc_id:
+                        events.append(sse_event_fn({
+                            "type": "TOOL_CALL_ARGS",
+                            "toolCallId": tc_id,
+                            "delta": accumulated,
+                        }))
+                        to_delete.append(tc_id)
+                except Exception:
+                    pass
         for tc_id in to_delete:
             self._args_buffer.pop(tc_id, None)
         return events
