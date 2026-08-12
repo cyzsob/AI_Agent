@@ -114,11 +114,11 @@ async def init_agent():
             logger.info(f"  [{group}] {t.name}")
 
     # ========== 构建多 Agent 图（Supervisor 模式） ==========
-    agent = await build_multi_agent(model, {
+    agent, worker_graphs = await build_multi_agent(model, {
         "knowledge": knowledge_tools,
         "devops": devops_tools,
         "general": general_tools,
     })
 
     logger.info(f"多 Agent 系统就绪: supervisor + 3 个专业 worker (初始化耗时: {(time.perf_counter() - start) * 1000:.0f}ms)")
-    return agent, all_tools
+    return agent, worker_graphs, all_tools

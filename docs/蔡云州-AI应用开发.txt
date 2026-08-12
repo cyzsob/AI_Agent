@@ -12,20 +12,18 @@
 7. 多轮对话：实现基于上下文的连续多轮对话能力，维护对话历史会话，支持追问、纠错与上下文关联理解，确保对话的连贯性与用户体验。
 8. 记忆存储、压缩与过期技术：采用分层记忆存储机制，结合上下文压缩算法减少 Token 占用，并通过 TTL（Time-To-Live）过期策略自动清理历史记忆，平衡对话质量与存储成本。
 
-项目：RAG智能知识库问答系统    AI应用开发工程师    时间：2026年4月-7月
-项目描述：基于DeepSeek大语言模型和LangGraph多Agent框架开发的RAG知识库问答系统
-技术栈：Python 3、LangChain、LangGraph（Supervisor多Agent）、DeepSeek V4 Flash API、Ollama（bge-m3嵌入模型）、PGVector（余弦相似度）、rank_bm25（BM25关键词检索）、RRF融合、Cross-Encoder重排、FastAPI、AG-UI协议、MCP协议、PyMuPDF + RapidOCR、智谱GLM-4V多模态、Vue 3、TypeScript、A2UI协议
-负责模块：后端Agent服务，混合检索模块，知识库数据管道，MCP客户端集成，多模态图片理解，前端对话界面，A2UI富内容渲染
-技术描述：
-1. 基于 LangGraph 构建 Supervisor 多 Agent 架构，协调 Agent 路由分发至专业 Worker，支持多轮对话。
-2. 混合检索采用 PGVector 向量与 BM25 双路并行，RRF 融合后经 Cross-Encoder 二次重排。
-3. 基于 FastAPI + SSE 集成 AG-UI 协议，逐 token 流式对话，透传工具调用与完成事件。
-4. 知识库管道支持 TXT/PDF/DOCX 解析，PyMuPDF + RapidOCR 混合解析，sha256 指纹增量入库。
-5. 通过 MCP 协议自动发现外部工具，包装为 LangChain 工具注入 Agent，配置驱动扩展，已接入 Gitee。
-6. 基于 threadId 多轮会话管理，tiktoken 精确计数滑动裁剪，集成查询改写提升检索准确率。
-7. 用户上传图片经智谱 GLM-4V 视觉模型生成文字描述，合并进入 RAG 链路，实现多模态图片问答。
-8. 前端基于 Vue 3 + TypeScript + Vite，渲染 AI 返回的结构化 JSON UI，支持亮/暗色主题。
-
+项目：RAG智能知识库问答系统    AI应用开发工程师    时间：2026年6月-至今
+项目描述：基于LangChain和LangGraph框架开发的RAG知识库问答系统
+技术栈：LangChain、LangGraph、DeepSeek 、FastAPI、AG-UI协议、MCP、 RapidOCR、GLM-4V、Vue 3、TypeScript、A2UI协议
+主要职责：
+1.多Agent智能编排：基于 LangGraph 构建 Supervisor 多 Agent 架构，协调 Agent 根据用户意图路由分发至专业 Worker，支持复杂任务的分解执行与多轮对话。
+2.混合检索优化：采用 PGVector 向量与 BM25 关键词双路并行召回，通过 RRF 融合算法合并多路检索候选列表，并引入 Cross-Encoder 模型进行二次精细化重排，显著提升检索召回准确率与大模型上下文质量。
+3.流式对话与协议集成：基于 FastAPI + SSE 集成 AG-UI 协议，实现逐 token 流式对话输出，透传工具调用与完成事件，提升交互实时性与开发可扩展性。
+4.文档解析与增量入库：RAG支持 TXT/PDF/DOCX 多格式文档解析，采用 PyMuPDF + RapidOCR 混合解析方案，基于 sha256 文件指纹实现增量入库，支撑知识库的高效构建与持续更新。
+5.工具自动发现与扩展：通过 MCP 协议自动发现外部工具，封装为 LangChain 工具注入 Agent，实现配置驱动的即插即用扩展，已接入 Gitee 仓库能力。
+6.会话管理与查询优化：基于 threadId 实现多轮会话管理，采用 tiktoken 精确计数进行上下文滑动裁剪，并集成查询改写策略提升检索准确率。
+7.多模态图片问答：用户上传图片经智谱 GLM-4V 视觉模型生成文字描述，合并进入 RAG 检索链路，实现多模态图片问答能力。
+8.前端交互开发：基于 Vue 3 + TypeScript + Vite 构建前端，渲染 AI 返回的结构化 JSON UI，支持亮/暗色主题切换。
 工作经历
 艾普阳（深圳）科技有限公司     鸿蒙开发 | AI应用开发          2022.06-2025.01
 

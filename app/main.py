@@ -40,18 +40,19 @@ async def _agent_init():
     from app.mcp.client import disconnect_all_mcp_servers
 
     logger.info("正在初始化 Agent…")
-    agent, tools = await init_agent()
+    agent, worker_graphs, tools = await init_agent()
 
-    # 注入到 routes 模块
+    # 注入到 routes 模块（agent 主图 + worker 子图，后者供快速通道直接执行）
     from app.api import routes
     routes._agent_ref[0] = agent
+    routes._worker_graphs_ref[0] = worker_graphs
 
-    return agent, tools, disconnect_all_mcp_servers
+    return agent, worker_graphs, tools, disconnect_all_mcp_servers
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    agent, tools, disconnect_fn = await _agent_init()
+    agent, worker_graphs, tools, disconnect_fn = await _agent_init()
     try:
         yield
     finally:

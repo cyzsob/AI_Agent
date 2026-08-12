@@ -19,9 +19,9 @@ from app.core.logging import get_logger
 from app.api.sse import (
     AgUiEventType,
     sse_event,
+    sse_custom,
     SUPERVISOR_NODE,
-    TRANSFER_TOOL_NAMES,
-    HANDOFF_TOOL_PREFIX,
+    SUMMARIZER_NODE,
     is_internal_tool,
     STREAM_DEBUG,
 )
@@ -31,6 +31,7 @@ from app.services.message import (
     compose_multimodal_message,
 )
 from app.api.stream import iter_tool_call_pieces, ToolCallTracker
+from app.agent.supervisor import detect_fast_path
 
 logger = get_logger()
 
@@ -38,6 +39,37 @@ router = APIRouter()
 
 # Agent reference (injected by main.py at startup)
 _agent_ref: list = [None]
+# Worker 子图映射 {节点名: CompiledStateGraph}（快速通道直接执行，注入于启动时）
+_worker_graphs_ref: list = [None]
+
+
+# ========== 阶段状态事件（CUSTOM） ==========
+# 在首字（TEXT_MESSAGE_START 之后、TEXT_MESSAGE_CONTENT 之前）的空窗期
+# 通过 AG-UI 标准 CUSTOM 事件（name="status"）按执行阶段上报进度，避免用户看到长时间静默。
+
+_STATUS_TEXT = {
+    "planner": "正在拆解任务…",
+    "worker": "正在检索/处理中…",
+    "summarizer": "正在汇总回答…",
+}
+
+
+def _phase_of(ns, node_name: str | None) -> str | None:
+    """根据流事件的节点归属判断当前执行阶段；无法识别时返回 None。
+
+    - ns 非空 → worker 子图内部事件（完整流程下的 worker 阶段）
+    - 顶层 planner / summarizer 节点 → 对应阶段
+    - 顶层 agent 节点 → 快速通道下 worker 子图的 LLM 节点
+    """
+    if ns:
+        return "worker"
+    if node_name == "planner":
+        return "planner"
+    if node_name == SUMMARIZER_NODE:
+        return "summarizer"
+    if node_name == "agent":
+        return "worker"
+    return None
 
 
 # ========== AG-UI 协议端点 ==========
@@ -158,17 +190,39 @@ async def chat(request: Request):
             history = get_or_create_history(thread_id)
             full_messages = [*to_langchain_messages(history), user_message_record]
 
-            # Agent 流式执行
+            # 方案一：在 Agent 执行前立即打开文本消息（"打字中"状态），
+            # 让用户第一时间看到回复已开始，而不是在 planner/worker 阶段静默等待
             message_id = str(uuid.uuid4())
-            text_message_started = False
+            yield sse_event({
+                "type": AgUiEventType.TEXT_MESSAGE_START,
+                "messageId": message_id,
+                "role": "assistant",
+            })
+
+            # 方案二：领域明确的请求走快速通道（直达对应 worker，跳过 planner+summarizer，
+            # 3 次 LLM 往返降为 1 次）；无法确定的请求走完整多 Agent 流程
+            fast_target = detect_fast_path(user_message)
+            if fast_target:
+                log.info(f"快速通道: 直达 worker_{fast_target}")
+                worker_graph = _worker_graphs_ref[0].get(fast_target)
+                if worker_graph is None:
+                    raise ValueError(f"快速通道目标不可用: {fast_target}")
+                stream = worker_graph.astream(
+                    {"messages": full_messages},
+                    stream_mode="messages",
+                    subgraphs=True,
+                )
+            else:
+                log.info("完整多 Agent 流程: planner → worker → summarizer")
+                stream = _agent_ref[0].astream(
+                    {"messages": full_messages},
+                    stream_mode="messages",
+                    subgraphs=True,
+                )
+
             tracker = ToolCallTracker()
             final_content = ""
-
-            stream = _agent_ref[0].astream(
-                {"messages": full_messages},
-                stream_mode="messages",
-                subgraphs=True,
-            )
+            last_phase: str | None = None
 
             async for event in stream:
                 # subgraphs=True 事件结构兼容处理
@@ -187,6 +241,12 @@ async def chat(request: Request):
                         f"ns={ns}, node={node_name}, type={chunk_type}, "
                         f"has_tool_call_id={getattr(chunk, 'tool_call_id', None) is not None}"
                     )
+
+                # ---- 阶段状态（CUSTOM 事件，阶段切换时只发一次） ----
+                phase = _phase_of(ns, node_name)
+                if phase and phase != last_phase:
+                    last_phase = phase
+                    yield sse_custom("status", {"message": _STATUS_TEXT.get(phase, "正在处理中…")})
 
                 # ---- Supervisor 节点：仅内部路由，不透出 ----
                 if node_name == SUPERVISOR_NODE:
@@ -239,7 +299,7 @@ async def chat(request: Request):
                         log.warning(f"ToolMessage without tool_call_id! content={str(chunk.content)[:100]}")
                     continue
 
-                # ---- Worker 节点输出（文本 + 工具调用） ----
+                # ---- Worker / Agent 节点输出（文本 + 工具调用） ----
                 if isinstance(chunk, AIMessage):
                     # 工具调用增量
                     for tc_id, tc_name, tc_args in iter_tool_call_pieces(chunk):
@@ -265,19 +325,21 @@ async def chat(request: Request):
                         for event_str in tracker.flush_complete_args_events(sse_event):
                             yield event_str
 
-                    # 文本内容
+                    # 文本内容透出规则：
+                    #   - 快速通道：透出 worker 子图的 agent 节点文本（即最终回答）
+                    #   - 完整流程：只透出汇总器节点的最终回答；
+                    #     worker 子图文本（ns 非空或节点名非 summarizer）隐藏，
+                    #     避免"冗余内容太多 / 重复回答"直接暴露给前端
                     chunk_content = chunk.content if isinstance(chunk.content, str) else ""
-                    if chunk_content:
+                    if fast_target:
+                        show_text = (not ns) and node_name == "agent"
+                    else:
+                        show_text = (not ns) and node_name == SUMMARIZER_NODE
+                    if chunk_content and not show_text:
+                        if STREAM_DEBUG:
+                            log.debug(f"隐藏文本, node={node_name}, ns={ns}, len={len(chunk_content)}")
+                    elif chunk_content:
                         final_content += chunk_content
-
-                        if not text_message_started:
-                            log.debug(f">>> TEXT_MESSAGE_START, messageId={message_id}")
-                            yield sse_event({
-                                "type": AgUiEventType.TEXT_MESSAGE_START,
-                                "messageId": message_id,
-                                "role": "assistant",
-                            })
-                            text_message_started = True
 
                         if STREAM_DEBUG:
                             log.debug(f">>> TEXT_MESSAGE_CONTENT, delta={chunk_content[:50]}")
@@ -288,21 +350,9 @@ async def chat(request: Request):
                         })
 
             # ========== 保存本轮消息到历史 ==========
-            turn_messages = []
-
-            # 用户消息
-            turn_messages.append(user_message_record)
-
-            # 工具调用记录 + 工具返回结果
-            if tracker.tool_call_ids:
-                turn_messages.append({
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": tracker.build_history_tool_calls(),
-                })
-            turn_messages.extend(tracker.tool_messages)
-
-            # 最终回答
+            # 只保存 用户消息 + 最终回答（不保存 worker 的工具调用记录与
+            # 工具结果，避免旧 tool_call 痕迹干扰后续轮次的 planner 与历史 token 膨胀）
+            turn_messages = [user_message_record]
             if final_content:
                 turn_messages.append({
                     "role": "assistant",
@@ -316,13 +366,8 @@ async def chat(request: Request):
                 log.warning(f"兜底发送残余 args")
                 yield event_str
 
-            # 兜底文本开始
-            if not text_message_started:
-                yield sse_event({
-                    "type": AgUiEventType.TEXT_MESSAGE_START,
-                    "messageId": message_id,
-                    "role": "assistant",
-                })
+            # 兜底文本（TEXT_MESSAGE_START 已提前发送，此处只补内容）
+            if not final_content:
                 yield sse_event({
                     "type": AgUiEventType.TEXT_MESSAGE_CONTENT,
                     "messageId": message_id,
