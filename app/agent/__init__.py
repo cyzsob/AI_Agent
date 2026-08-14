@@ -36,6 +36,10 @@ model = ChatOpenAI(
     temperature=0,
     openai_api_key=os.getenv("DEEPSEEK_API_KEY"),
     openai_api_base="https://api.deepseek.com/v1",
+    # 请求超时：默认 600s 太长，一次 DeepSeek 请求挂起会让整个 SSE 流卡死、
+    # run-state 永远停在 running（僵尸状态）。120s 对正常调用（数秒~数十秒）
+    # 足够宽松，又能保证异常挂起最终抛错、流能走完收尾。
+    timeout=120,
     # 防止 LLM 在长回答中重复输出相同内容：
     #   - presence_penalty: 惩罚已出现过的 token，降低段落级重复概率
     #   - frequency_penalty: 按出现频次惩罚高频 token，抑制短语/句子重复

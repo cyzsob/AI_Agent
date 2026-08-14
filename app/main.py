@@ -53,6 +53,15 @@ async def _agent_init():
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     agent, worker_graphs, tools, disconnect_fn = await _agent_init()
+
+    # 初始化上下文记忆模块（memory_long 表 + HNSW 索引，幂等）。
+    # 失败只记日志：长期记忆不可用不影响短期记忆与主对话。
+    try:
+        from app.memory.long_term import init_memory_tables
+        await init_memory_tables()
+    except Exception as err:
+        logger.error(f"初始化记忆表失败（长期记忆不可用，短期记忆不受影响）: {err}")
+
     try:
         yield
     finally:

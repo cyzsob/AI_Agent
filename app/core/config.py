@@ -35,6 +35,15 @@ DB_NAME = _require_env("DB_NAME", "数据库名称")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bge-m3")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
+# ---- Redis / 上下文记忆 ----
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+SHORT_MEMORY_TTL = int(os.getenv("SHORT_MEMORY_TTL", "3600"))
+SHORT_MEMORY_MAX_MSGS = int(os.getenv("SHORT_MEMORY_MAX_MSGS", "20"))
+RUN_STATE_TTL = int(os.getenv("RUN_STATE_TTL", "900"))
+MEMORY_DISTANCE_THRESHOLD = float(os.getenv("MEMORY_DISTANCE_THRESHOLD", "0.6"))
+MEMORY_RETRIEVAL_K = int(os.getenv("MEMORY_RETRIEVAL_K", "5"))
+MEMORY_LONG_ENABLED = os.getenv("MEMORY_LONG_ENABLED", "true").lower() == "true"
+
 # ---- 重排模型 ----
 RERANK_MODEL = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-base")
 

@@ -100,6 +100,15 @@ class MultiAgentState(TypedDict):
     # 本轮原始用户问题（仅汇总器与日志使用）
     original_query: str
 
+    # 运行状态持久化标识（由 routes 层注入；用于把 planner 任务拆解与
+    # worker 进度写入 Redis run-state，SSE 中断后可查）
+    run_id: str
+    thread_id: str
+
+    # 续跑模式：由 resume 接口注入的预定义任务拆解（非空时 planner 直接复用，
+    # 跳过 LLM 拆解；其余流程与正常执行完全一致）
+    predefined_tasks: list[dict]
+
 
 # ========== Worker 专业提示词 ==========
 
@@ -218,24 +227,27 @@ def _latest_user_query(msgs: list) -> str:
 
 
 def _build_planner_input(msgs: list, latest_query: str) -> list:
-    """构造 planner 的 LLM 输入：最近若干条 worker 结论（截断）+ 最新用户问题。
+    """构造 planner 的 LLM 输入：最近若干轮 user/assistant 完整对（截断）+ 最新用户问题。
 
-    只喂精简上下文，避免全量历史（含大段工具结果）导致 TTFT 与成本膨胀。
+    相比旧版（仅 3 条 AI 文本）能看到上一轮用户提问与工具结果摘要，
+    提升多轮指代（它/其中/这些）的消解能力；仍控制总量避免 TTFT 与成本膨胀。
     """
-    inputs = []
-    ai_texts = [
-        m for m in msgs
-        if getattr(m, "type", None) == "ai"
-        and isinstance(getattr(m, "content", None), str)
-        and m.content.strip()
-    ]
-    for m in ai_texts[-3:]:
-        content = m.content.strip()
-        if len(content) > 300:
-            content = content[:300] + "…"
-        inputs.append(AIMessage(content=content))
-    inputs.append(HumanMessage(content=latest_query))
-    return inputs
+    rounds = []
+    for m in msgs:
+        t = getattr(m, "type", None)
+        content = getattr(m, "content", "")
+        if t not in ("human", "ai") or not isinstance(content, str) or not content.strip():
+            continue
+        content = content.strip()
+        if len(content) > 600:
+            content = content[:600] + "…"
+        rounds.append(
+            HumanMessage(content=content) if t == "human" else AIMessage(content=content)
+        )
+    # 去掉最后一条 human（即当前问题），避免与 latest_query 重复
+    if rounds and getattr(rounds[-1], "type", None) == "human":
+        rounds.pop()
+    return [*rounds[-6:], HumanMessage(content=latest_query)]
 
 
 def _extract_worker_result(msgs: list) -> str:
@@ -248,6 +260,18 @@ def _extract_worker_result(msgs: list) -> str:
         ):
             return m.content.strip()
     return ""
+
+
+async def _update_run_state(run_id: str, fields: dict) -> None:
+    """把多 Agent 运行进度写入 Redis run-state；任何失败静默，绝不拖垮主流程。"""
+    if not run_id or not fields:
+        return
+    try:
+        from app.memory.redis_store import update_run_state
+
+        await update_run_state(run_id, **fields)
+    except Exception as err:
+        logger.warning(f"运行状态持久化失败: {err}")
 
 
 # ========== 节点构造 ==========
@@ -264,6 +288,34 @@ def _make_planner_node(model, members: dict[str, str]):
         latest_query = _latest_user_query(msgs)
         if not latest_query:
             latest_query = state.get("original_query", "")
+
+        # 续跑模式：直接复用预定义任务拆解（跳过 planner LLM 调用与解析）
+        predefined = state.get("predefined_tasks") or []
+        if predefined:
+            tasks = []
+            for idx, t in enumerate(predefined):
+                if not isinstance(t, dict):
+                    continue
+                target = str(t.get("target", "")).strip()
+                instruction = str(t.get("instruction", "")).strip()
+                if not target or not instruction:
+                    continue
+                tasks.append({
+                    "id": str(idx + 1),
+                    "target": target,
+                    "instruction": instruction,
+                    "depends_on": t.get("depends_on"),
+                    "summary": str(t.get("summary", "") or ""),
+                })
+            if tasks:
+                logger.info(f"续跑模式: 复用 {len(tasks)} 个未完成任务: {[t['target'] for t in tasks]}")
+                await _update_run_state(state.get("run_id", ""), {
+                    "thread_id": state.get("thread_id", ""),
+                    "original_query": latest_query,
+                    "status": "running",
+                    "tasks": tasks,
+                })
+                return {"tasks": tasks, "original_query": latest_query}
 
         response = await model.ainvoke(
             [SystemMessage(content=prompt), *_build_planner_input(msgs, latest_query)]
@@ -313,9 +365,38 @@ def _make_planner_node(model, members: dict[str, str]):
             logger.warning("planner 解析失败或无有效任务，兜底交给 general")
 
         logger.info(f"Planner 拆解出 {len(tasks)} 个任务: {[t['target'] for t in tasks]}")
+        # 运行状态：记录本轮计划（任务拆解），供中断后查询"上次进行到哪一步"
+        await _update_run_state(state.get("run_id", ""), {
+            "thread_id": state.get("thread_id", ""),
+            "original_query": latest_query,
+            "status": "running",
+            "tasks": tasks,
+        })
         return {"tasks": tasks, "original_query": latest_query}
 
     return planner_node
+
+
+def _compact_worker_context(state: MultiAgentState, limit: int = 6, per_msg: int = 400) -> str:
+    """从共享状态提取最近若干条 user/assistant 文本（含工具结果摘要）供 worker 参考。
+
+    仅只读共享历史、不写入共享状态，不破坏 worker 之间的结果隔离
+    （隔离针对的是各自结果写入 task_results，见 build_multi_agent 注释）。
+    去掉最后一条 human（当前问题），由指令承载，避免重复。
+    """
+    texts = []
+    for m in state.get("messages", []):
+        t = getattr(m, "type", None)
+        content = getattr(m, "content", "")
+        if t not in ("human", "ai") or not isinstance(content, str) or not content.strip():
+            continue
+        content = content.strip()
+        if len(content) > per_msg:
+            content = content[:per_msg] + "…"
+        texts.append(content)
+    if texts:
+        texts.pop()
+    return "\n".join(texts[-limit:])
 
 
 def _make_route_dispatch(worker_nodes: set[str]):
@@ -328,13 +409,21 @@ def _make_route_dispatch(worker_nodes: set[str]):
         if any(t.get("depends_on") for t in tasks):
             logger.info(f"任务存在依赖，走串行执行器: {[t['target'] for t in tasks]}")
             return "executor"
+        context = _compact_worker_context(state)
         sends = []
         for t in tasks:
             node = f"worker_{t['target']}"
             if node not in worker_nodes:
                 logger.warning(f"未知 worker 节点: {node}，跳过")
                 continue
-            sends.append(Send(node, {"messages": [HumanMessage(content=t["instruction"])]}))
+            msgs = [HumanMessage(content=t["instruction"])]
+            if context:
+                msgs.append(SystemMessage(content=f"可参考的对话上下文（来自本会话历史）：\n{context}"))
+            sends.append(Send(node, {
+                "messages": msgs,
+                "run_id": state.get("run_id", ""),
+                "thread_id": state.get("thread_id", ""),
+            }))
         if not sends:
             return END
         logger.info(f"并行分发 {len(sends)} 个任务: {[t['target'] for t in tasks]}")
@@ -353,10 +442,12 @@ def _make_executor_node(worker_graphs: dict):
     async def executor_node(state: MultiAgentState):
         tasks = state.get("tasks", [])
         results = {}
+        run_id = state.get("run_id", "")
         for t in tasks:
             target = t["target"]
             graph = worker_graphs.get(target)
             if graph is None:
+                await _update_run_state(run_id, {f"task:{target}": "failed"})
                 results[target] = {
                     "ok": False,
                     "result": "",
@@ -364,10 +455,14 @@ def _make_executor_node(worker_graphs: dict):
                 }
                 continue
             try:
-                result = await graph.ainvoke(
-                    {"messages": [HumanMessage(content=t["instruction"])]}
-                )
+                await _update_run_state(run_id, {f"task:{target}": "running"})
+                context = _compact_worker_context(state)
+                msgs = [HumanMessage(content=t["instruction"])]
+                if context:
+                    msgs.append(SystemMessage(content=f"可参考的对话上下文（来自本会话历史）：\n{context}"))
+                result = await graph.ainvoke({"messages": msgs})
                 text = _extract_worker_result(result.get("messages", []))
+                await _update_run_state(run_id, {f"task:{target}": "done" if text else "failed"})
                 results[target] = {
                     "ok": bool(text),
                     "result": text,
@@ -375,6 +470,7 @@ def _make_executor_node(worker_graphs: dict):
                 }
             except Exception as err:
                 logger.error(f"executor 串行执行 {target} 失败: {err}")
+                await _update_run_state(run_id, {f"task:{target}": "failed"})
                 results[target] = {
                     "ok": False,
                     "result": "",
@@ -478,20 +574,32 @@ async def build_multi_agent(model, workers: dict[str, list]):
         subgraph = worker_graphs[node]
 
         async def _safe_worker(state: MultiAgentState, _sg=subgraph, _name=wname, _target=node):
+            run_id = state.get("run_id", "")
+            await _update_run_state(run_id, {f"task:{_target}": "running"})
             try:
-                sub_result = await _sg.ainvoke(state)
+                # 只把 messages 传给 worker 子图：Send 分支状态里额外携带的
+                # run_id/thread_id 不在 ReAct 子图的 schema 内，直接透传会校验失败
+                sub_result = await _sg.ainvoke({"messages": state.get("messages", [])})
                 text = _extract_worker_result(sub_result.get("messages", []))
                 entry = (
                     {"ok": True, "result": text, "summary": ""}
                     if text
                     else {"ok": False, "result": "", "summary": ""}
                 )
+                await _update_run_state(run_id, {
+                    f"task:{_target}": "done" if text else "failed",
+                    f"result:{_target}": text,
+                })
                 return {
                     "messages": sub_result.get("messages", []),
                     "task_results": {_target: entry},
                 }
             except Exception as err:
                 logger.error(f"worker {_name} 执行失败: {err}")
+                await _update_run_state(run_id, {
+                    f"task:{_target}": "failed",
+                    f"result:{_target}": "",
+                })
                 return {
                     "messages": [AIMessage(content=f"[{_name} 任务执行失败: {err}]")],
                     "task_results": {_target: {"ok": False, "result": "", "summary": ""}},
