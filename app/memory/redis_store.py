@@ -22,6 +22,7 @@ logger = get_logger()
 
 _MSG_KEY = "memory:short:{thread_id}:messages"
 _SUMMARY_KEY = "memory:short:{thread_id}:summary"
+_META_KEY = "memory:short:{thread_id}:meta"
 _RUN_KEY = "memory:run:{run_id}"
 
 _redis: Optional[aioredis.Redis] = None
@@ -37,6 +38,10 @@ def _msg_key(thread_id: str) -> str:
 
 def _summary_key(thread_id: str) -> str:
     return _SUMMARY_KEY.format(thread_id=thread_id)
+
+
+def _meta_key(thread_id: str) -> str:
+    return _META_KEY.format(thread_id=thread_id)
 
 
 def _run_key(run_id: str) -> str:
@@ -150,6 +155,47 @@ async def delete_thread(thread_id: str) -> None:
         await r.delete(_msg_key(thread_id), _summary_key(thread_id))
     except Exception as err:
         logger.warning(f"清理短期记忆失败: {err}")
+
+
+async def get_session_meta(thread_id: str) -> Optional[dict]:
+    """读取会话元数据；Redis 不可用/读取失败返回 None。"""
+    r = await get_redis()
+    if r is None:
+        return None
+    try:
+        raw = await r.get(_meta_key(thread_id))
+        return json.loads(raw) if raw else None
+    except Exception as err:
+        logger.warning(f"读取会话元数据失败: {err}")
+        return None
+
+
+async def set_session_meta(thread_id: str, meta: dict) -> bool:
+    """写入会话元数据，并刷新 TTL。"""
+    r = await get_redis()
+    if r is None:
+        return False
+    try:
+        key = _meta_key(thread_id)
+        pipe = r.pipeline()
+        pipe.set(key, json.dumps(meta, ensure_ascii=False))
+        pipe.expire(key, SHORT_MEMORY_TTL)
+        await pipe.execute()
+        return True
+    except Exception as err:
+        logger.warning(f"写入会话元数据失败: {err}")
+        return False
+
+
+async def delete_session_meta(thread_id: str) -> None:
+    """删除指定会话的元数据 Key。"""
+    r = await get_redis()
+    if r is None:
+        return
+    try:
+        await r.delete(_meta_key(thread_id))
+    except Exception as err:
+        logger.warning(f"清理会话元数据失败: {err}")
 
 
 async def flush_memory() -> int:

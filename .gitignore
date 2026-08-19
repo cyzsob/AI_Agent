@@ -13,6 +13,9 @@ build/
 logs/
 data/
 
+# 文档（简历、面试资料等，不提交）
+docs/
+
 # IDE / 工具配置
 .trae/
 

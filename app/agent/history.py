@@ -15,6 +15,8 @@
 #     "tool_call_id": str | None }                      # 仅 tool 消息时
 
 import json
+import time
+import uuid
 
 import tiktoken
 
@@ -32,6 +34,8 @@ TOKEN_ENCODING = "cl100k_base"
 _sessions: dict[str, list[dict]] = {}
 # 内存兜底滚动摘要：dict[threadId, str]
 _fallback_summaries: dict[str, str] = {}
+# 内存兜底会话元数据：dict[threadId, dict]
+_session_meta: dict[str, dict] = {}
 
 # Tokenizer 惰性加载（模块级单例）
 _encoder = None
@@ -182,8 +186,50 @@ async def clear_history(thread_id: str) -> None:
     _fallback_summaries.pop(thread_id, None)
 
 
+# ========== 会话管理（创建 / 查询 / 删除） ==========
+
+
+async def create_session(title: str | None = None) -> dict:
+    """创建会话，返回会话元数据（含服务端生成的 thread_id）。"""
+    thread_id = f"session-{uuid.uuid4().hex}"
+    now = time.time()
+    meta = {
+        "threadId": thread_id,
+        "title": (title or "").strip() or "新会话",
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    ok = await redis_store.set_session_meta(thread_id, meta)
+    if not ok:
+        # Redis 不可用 → 写入内存兜底
+        _session_meta[thread_id] = meta
+    return meta
+
+
+async def get_session(thread_id: str) -> dict | None:
+    """获取会话数据（元数据 + 历史消息 + 滚动摘要）；不存在返回 None。"""
+    meta = await redis_store.get_session_meta(thread_id)
+    if meta is None:
+        meta = _session_meta.get(thread_id)
+    if meta is None:
+        return None
+    messages = await get_or_create_history(thread_id)
+    summary = await get_summary(thread_id)
+    return {**meta, "messages": messages, "summary": summary}
+
+
+async def delete_session(thread_id: str) -> None:
+    """删除会话（元数据 + 历史 + 滚动摘要，Redis + 内存兜底）"""
+    await redis_store.delete_session_meta(thread_id)
+    await redis_store.delete_thread(thread_id)
+    _session_meta.pop(thread_id, None)
+    _sessions.pop(thread_id, None)
+    _fallback_summaries.pop(thread_id, None)
+
+
 async def clear_all_histories() -> None:
     """清除所有会话历史（Redis + 内存兜底）"""
     await redis_store.flush_memory()
     _sessions.clear()
     _fallback_summaries.clear()
+    _session_meta.clear()

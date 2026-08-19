@@ -757,6 +757,46 @@ async def chat_clear(request: Request):
     return {"success": True, "threadId": thread_id}
 
 
+# ========== 会话管理端点 ==========
+
+
+@router.post("/api/sessions")
+async def create_session_endpoint(request: Request):
+    """创建会话，返回服务端生成的 threadId。"""
+    from app.agent.history import create_session
+
+    title = None
+    try:
+        body = await request.json()
+        title = body.get("title")
+    except (json.JSONDecodeError, ValueError):
+        pass  # 无请求体 / 非法 JSON 时按默认标题创建
+    session = await create_session(title)
+    logger.info(f"已创建会话: {session['threadId']}")
+    return session
+
+
+@router.get("/api/sessions/{thread_id}")
+async def get_session_endpoint(thread_id: str):
+    """获取会话数据（元数据 + 历史消息 + 滚动摘要）。"""
+    from app.agent.history import get_session
+
+    session = await get_session(thread_id)
+    if session is None:
+        return JSONResponse({"error": "session not found"}, status_code=404)
+    return session
+
+
+@router.delete("/api/sessions/{thread_id}")
+async def delete_session_endpoint(thread_id: str):
+    """删除会话（元数据 + 历史 + 滚动摘要）。"""
+    from app.agent.history import delete_session
+
+    await delete_session(thread_id)
+    logger.info(f"已删除会话: {thread_id}")
+    return {"success": True, "threadId": thread_id}
+
+
 # ========== 运行状态查询端点 ==========
 
 
